@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "maid-cafe-menu",
+  "main": "server/worker.js",
+  "compatibility_date": "2024-04-03",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MAID_CAFE_DO",
+        "class_name": "MaidCafeDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MaidCafeDO"]
+    }
+  ],
+  "vars": {
+    "ADMIN_PASSWORD": "maid2024"
+  }
+}
