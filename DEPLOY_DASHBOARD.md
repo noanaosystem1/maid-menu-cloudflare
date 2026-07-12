@@ -1,116 +1,143 @@
-# Cloudflare Dashboard 手動デプロイ手順書
+# Cloudflare & GitHub 連動・自動デプロイ手順書
 
-本手順書は、Wrangler CLI（コマンドラインツール）を使用せず、**Cloudflare Dashboard（管理Web画面）のGUI操作のみ**で、本システムの「静的フロントエンド（Vite）」および「Durable Objects (SQLite 搭載) バックエンド」をデプロイするための詳細マニュアルです。
+本手順書は、Wrangler CLI によるローカルからの手動デプロイではなく、**GitHub リポジトリと Cloudflare Dashboard を直接連携させ、コミットのプッシュをトリガーに「静的フロントエンド」および「Durable Objects (SQLite 搭載) バックエンド」を完全自動デプロイ（CI/CD）する**ための詳細マニュアルです。
+
+---
+
+## 全体設計イメージ
+
+```
+ [ローカル開発]             [GitHub リポジトリ]                  [Cloudflare Platform]
+   │                             │                                      │
+   │─── git push origin main ───►│                                      │
+   │                             │─── (A) Trigger Pages Deploy ────────►│ (Pages: フロントエンドビルド & 配信)
+   │                             │                                      │
+   │                             │─── (B) Trigger GitHub Actions ──────►│ (Worker: バックエンドデプロイ)
+```
+
+- **フロントエンド (Pages):** GitHub リポジトリと Cloudflare Pages を直接連携させ、`main` ブランチへのプッシュ時に Cloudflare 側で自動ビルド & 配信を行います。
+- **バックエンド (Worker & Durable Objects):** GitHub Actions を利用し、`main` ブランチへのプッシュ時に Cloudflare Workers へ自動デプロイします。
 
 ---
 
 ## 前提条件
 
-1. **Cloudflare アカウント:**
-   - [Cloudflare Dashboard](https://dash.cloudflare.com/) にログインできること。
+1. **GitHub アカウント & リポジトリ:**
+   - 本システムのコードが GitHub の非公開（プライベート）または公開リポジトリにホストされていること。
 2. **Durable Objects の利用資格:**
    - Durable Objects は、Cloudflare **Workers Paid プラン（月額 $5〜）**でのみ利用可能です。デプロイ先の Cloudflare アカウントで Workers Paid が有効になっていることを確認してください。
-3. **ローカルでの事前ビルド:**
-   - デプロイする静的ファイル一式（`dist` ディレクトリ）を準備するため、ローカルで事前に一度ビルドを行ってください。
-   ```bash
-   npm run build
-   ```
-   ビルド完了後、プロジェクト直下に生成される `dist/` ディレクトリ内のファイルをダッシュボードへアップロードします。
 
 ---
 
-## 手順 1. Durable Objects の作成と有効化
+## 手順 1. フロントエンド（Cloudflare Pages）の GitHub 連携デプロイ
 
-Durable Objects は、通常の Workers デプロイ時にバインディング（紐付け）を定義することで自動生成されます。手動で最初に行う設定はありませんが、アカウントが **Workers Paid** プランに加入している必要があります。
-
----
-
-## 手順 2. Workers & Pages の新規作成
+Cloudflare Pages の持つ Git 統合機能を利用して、フロントエンド静的ファイルを自動ビルド・デプロイします。
 
 1. **Cloudflare Dashboard** にログインします。
-2. 左メニューから **「Workers & Pages」（Workers と Pages）** を選択します。
-3. 画面右上の **「Create Application」（アプリケーションの作成）** ボタンをクリックします。
-4. **「Workers」** タブが選択されている状態で、**「Create Worker」（Worker の作成）** ボタンをクリックします。
-5. Worker に任意の名前（例: `maid-cafe-menu`）を入力し、画面右下の **「Deploy」（デプロイ）** をクリックします。
-   *(※この段階では、デフォルトのハローワールドコードがデプロイされます。次のステップで上書きします)*
+2. 左メニューから **「Workers & Pages」** ＞ **「Overview」（概要）** を選択します。
+3. **「Create」（作成）** ＞ **「Pages」** タブ ＞ **「Connect to Git」（Git に接続）** ボタンをクリックします。
+4. **「GitHub」** を選択し、指示に従って GitHub アカウントとの連携認証および対象リポジトリへのアクセス権を付与します。
+5. デプロイ対象のリポジトリを選択し、**「Begin setup」（セットアップの開始）** をクリックします。
+6. **「Build settings」（ビルド設定）** を以下の通り入力します：
+   - **Framework preset（フレームワークのプリセット）:** `Vite` (または `None`)
+   - **Build command（ビルドコマンド）:** `npm run build`
+   - **Build output directory（ビルド出力ディレクトリ）:** `dist`
+   - **Root directory（ルートディレクトリ）:** 空白（リポジトリルート）
+7. **「Save and Deploy」（保存してデプロイ）** をクリックします。
+   - これにより、初回ビルドが開始され、以降は `main` ブランチへのプッシュごとに自動でフロントエンドがビルド & 更新されます。
 
 ---
 
-## 手順 3. 環境変数（ADMIN_PASSWORD）の設定
+## 手順 2. バックエンド（Cloudflare Workers & Durable Objects）の GitHub Actions 自動デプロイ
 
-管理画面や各種管理用APIの認証に利用するパスワードを設定します。
+バックエンドの Worker コード（`server/worker.js`）および SQLite Durable Object スキーマ定義を GitHub Actions を使って自動デプロイします。
 
-1. 作成した Worker の詳細ダッシュボード画面を開きます。
-2. 上部タブから **「Settings」（設定）** ＞ **「Variables」（変数）** を選択します。
-3. **「Environment Variables」（環境変数）** セクションで **「Add Variable」（変数の追加）** をクリックします。
-4. 以下の通り入力します：
-   - **Name（名前）:** `ADMIN_PASSWORD`
-   - **Type（タイプ）:** `Encrypt / Secret` (暗号化) または `Text`
-   - **Value（値）:** 任意のパスワード（例: `maid2024`）
-5. **「Save and Deploy」（保存してデプロイ）** をクリックします。
+### 2.1 API トークンとアカウント ID の取得
 
----
+GitHub Actions から Cloudflare にデプロイするための認証情報を取得します。
 
-## 手順 4. Durable Objects バインディングの設定
+1. **Cloudflare アカウント ID の取得:**
+   - Cloudflare Dashboard の右側メニュー（または Worker 概要ページ）に表示されている **「Account ID」（アカウント ID）** をコピーして控えておきます。
+2. **API トークンの生成:**
+   - 画面右上のアイコン ＞ **「My Profile」（マイプロフィール）** ＞ **「API Tokens」（API トークン）** を選択します。
+   - **「Create Token」（トークンの作成）** をクリックし、**「Edit Cloudflare Workers」（Cloudflare Workers の編集）** テンプレートを使用します。
+   - 権限（Permissions）に以下が含まれていることを確認してください：
+     - `Account - Durable Objects - Edit`
+     - `Account - Worker Scripts - Edit`
+   - 生成された **API トークン** を安全にコピーして控えておきます。
 
-本システムの持久ストレージ（SQLite & WebSockets）である Durable Object を Worker に紐付けます。
+### 2.2 GitHub Secrets の設定
 
-1. Worker の **「Settings」（設定）** ＞ **「Bindings」（バインディング）** セクションにスクロールします。
-2. **「Add」（追加）** または **「Add Binding」（バインディングの追加）** をクリックし、**「Durable Object」** を選択します。
-3. 以下の通り設定値を入力します：
-   - **Variable Name（変数名）:** `MAID_CAFE_DO`
-   - **Class Name（クラス名）:** `MaidCafeDO`
-   - **Durable Object Namespace（名前空間）:**
-     - 既存のものが無い場合は、新規にクラス名 `MaidCafeDO` を指定して、Durable Object 名前空間をその場で新規作成・紐付けます。
-4. **「Save and Deploy」（保存してデプロイ）** をクリックします。
+取得した認証情報を GitHub リポジトリの機密変数（Secrets）に登録します。
 
----
+1. GitHub リポジトリのページを開き、**「Settings」（設定）** ＞ **「Secrets and variables」** ＞ **「Actions」** を選択します。
+2. **「New repository secret」（新しいリポジトリシークレット）** ボタンをクリックし、以下の2つを登録します：
+   - **Name:** `CLOUDFLARE_API_TOKEN` / **Value:** コピーした API トークン
+   - **Name:** `CLOUDFLARE_ACCOUNT_ID` / **Value:** コピーした アカウント ID
 
-## 手順 5. マイグレーションの実行
+### 2.3 ワークフロー定義ファイル (`.github/workflows/deploy.yml`) の作成
 
-Durable Objects で SQLite クラスを新規に定義するために、Cloudflare 上でマイグレーション定義（新しい Durable Object クラスの定義登録）を適用する必要があります。
+リポジトリ直下に以下の GitHub Actions ワークフローファイルを作成してコミット・プッシュします。
 
-1. Worker の **「Settings」（設定）** ＞ **「Durable Objects」** セクションに移動します。
-2. マイグレーション設定（Migrations）欄で、新規登録を行います。
-3. `wrangler.json` に記載されているマイグレーション設定を GUI 上で手動でマッピングします：
-   - **Tag（タグ）:** `v1`
-   - **New SQLite Classes（新規SQLiteクラス）:** `MaidCafeDO`
-4. 変更を保存して適用します。
+**ファイルパス:** `.github/workflows/deploy.yml`
 
----
+```yaml
+name: Deploy Cloudflare Worker
 
-## 手順 6. Worker コード (`worker.js`) の手動アップロード・貼り付け
+on:
+  push:
+    branches:
+      - main # main ブランチにプッシュされた時に動作します
 
-Vite ビルドプロセスによって、`server/worker.js` の内容は `dist/_worker.js` に自動的にコピーされています。このコードを Cloudflare のオンラインエディタに直接貼り付けます。
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-1. ローカル環境の `server/worker.js` の全内容、またはビルド成果物である `dist/_worker.js` の内容をすべてコピーします。
-2. Cloudflare Dashboard の Worker 画面右上にある **「Edit Code」（コードを編集）** ボタンをクリックします。
-3. ブラウザ上にオンラインエディタ（VS Code ライクな画面）が開きます。
-4. 左メニューのファイルリストから、メインファイル（通常 `index.js` または `worker.js`）を開きます。
-5. エディタ内の既存のコードをすべて削除し、手順 1 でコピーした `worker.js` の内容をそのまま貼り付けます。
-6. 画面右上の **「Save and Deploy」（保存してデプロイ）** ボタンをクリックします。
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
 
----
+      - name: Install Dependencies
+        run: npm ci
 
-## 手順 7. フロントエンド静的アセット (`dist/` 配下) のアップロード
-
-Cloudflare Workers に静的アセット（HTML/CSS/JSなど）を一緒にホスト・配信させるための手順です。
-
-1. **「Workers & Pages」** ＞ **「Pages」** 連携を利用するか、または上記で作成した Worker に静的アセット（`ASSETS` バインディング）を直接アップロードします。
-2. Dashboard 上で静的配信用の **Pages アプリケーション** を別途新規作成します。
-   - **「Create Application」** ＞ **「Pages」** タブ ＞ **「Upload assets」（アセットを直接アップロード）** を選択。
-   - プロジェクト名（例: `maid-cafe-frontend`）を入力。
-   - **「Upload」（アップロード）** 領域に、ローカルでビルドして得られた `dist/` ディレクトリそのものをドラッグ＆ドロップします（※`dist/` ディレクトリの中に `index.html` や `assets/` フォルダが直接入っている状態にしてください）。
-   - アップロード完了後、**「Deploy site」（サイトをデプロイ）** をクリックします。
+      - name: Deploy Worker via Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+```
 
 ---
 
-## 手順 8. ドメイン・ルーティングの統合（オプション）
+## 手順 3. 環境変数（ADMIN_PASSWORD）と Durable Objects の初期バインド
 
-Pages（フロントエンド）と Worker（バックエンド API / WebSocket）を同一ドメイン下で安全に協調動作させます。
+GitHub 経由の自動デプロイを行う前に、一度だけ Cloudflare のダッシュボード上で Worker に対して以下の設定を行います。
 
-1. Pages の **「Custom Domains」（カスタムドメイン）** で、運用したいドメインを設定します。
-2. Worker 側でも、同一ドメインの `/api/*` パスに対するリクエストが Worker に転送されるよう、**「Triggers」（トリガー）** タブの **「Routes」（ルート）** 設定にてルートを追加します：
-   - **Route:** `example.com/api/*`
-   - **Zone:** 対象のドメインゾーン
-3. これにより、ブラウザ上の同一ドメイン(`/api`)から、CORS制約を回避しながら安全に Durable Object の SQLite / WebSocket 接続へアクセスできるようになります。
+1. **環境変数の設定:**
+   - Cloudflare Dashboard ＞ **「Workers & Pages」** ＞ 作成された Worker ＞ **「Settings」** ＞ **「Variables」** に移動。
+   - 変数 `ADMIN_PASSWORD` に、管理者コンソールログイン用の安全なパスワードを入力し、保存します。
+2. **Durable Objects バインディングの登録:**
+   - 同じく **「Settings」** ＞ **「Bindings」（バインディング）** セクションへ移動。
+   - Durable Object バインディングを追加し、**変数名（Variable Name）** を `MAID_CAFE_DO`、**クラス名（Class Name）** を `MaidCafeDO` に指定して保存・デプロイします。
+3. **マイグレーションの登録:**
+   - **「Settings」** ＞ **「Durable Objects」** セクションへ移動し、マイグレーションタグ `v1` と SQLiteクラス名 `MaidCafeDO` のマッピングを保存します。
+   *(※これら1回限りのバインド定義を Cloudflare 側に記憶させることで、以降 GitHub Actions がプッシュをトリガーにデプロイしても、データベースや環境変数の設定が一切破壊されることなく安全に上書きデプロイされます)*
+
+---
+
+## 手順 4. ドメインの完全統合
+
+フロントエンド（Pages）とバックエンド（Worker）を同じドメインの傘下に入れ、シームレスな通信環境を作ります。
+
+1. **Pages カスタムドメインの設定:**
+   - Pages のダッシュボード ＞ **「Custom Domains」** で任意の独自ドメイン（例: `maid-cafe.example.com`）を設定します。
+2. **Worker ルーティングの登録:**
+   - 作成した Worker ＞ **「Triggers」** タブ ＞ **「Routes」（ルート）** にて以下のようにルートを追加します：
+     - **Route:** `maid-cafe.example.com/api/*`
+     - **Zone:** 対象の DNS ゾーン
+3. これにより、ブラウザ上の同一ドメインから `/api` に向けて CORS エラーの発生しない超高速な REST / WebSocket 接続（冬眠 API）が自動的に機能します。
