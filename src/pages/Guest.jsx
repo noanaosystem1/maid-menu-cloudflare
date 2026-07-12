@@ -138,7 +138,7 @@ export default function Guest() {
         socketRef.current = null;
       }
     };
-  }, [guestUser, room?.roomId]); // Bind to roomId instead of the entire room object to avoid trigger loops but preserve connectivity
+  }, [guestUser, room?.id]); // Bind to id instead of the entire room object to avoid trigger loops but preserve connectivity
 
   const handleCountdownEnd = useCallback(() => {
     if (token) localStorage.setItem(STORAGE_KEYS.BLACKOUT_LOCK(token), "true");

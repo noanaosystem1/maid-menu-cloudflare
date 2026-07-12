@@ -115,29 +115,10 @@ export class MaidCafeDO {
         this.broadcastToRoom(roomId, { type: "GUEST_UPDATE", guestId, isOnline: true });
       }
 
-      // Initial state push (room state & whole database stats if admin joins)
+      // Initial state push (room state)
       const room = this.querySingle("SELECT * FROM rooms WHERE id = ?", roomId);
       if (room) {
         server.send(JSON.stringify({ type: "PHASE_UPDATE", phase: room.phase }));
-      }
-
-      if (role === "admin") {
-        const roomsList = this.query("SELECT * FROM rooms ORDER BY created_date DESC");
-        const guestsList = this.query("SELECT * FROM guest_users ORDER BY created_date DESC");
-        server.send(JSON.stringify({
-          type: "ADMIN_INIT",
-          rooms: roomsList,
-          guests: guestsList.map(row => ({
-            id: row.id,
-            name: row.name,
-            roomId: row.room_id,
-            sessionToken: row.session_token,
-            isActive: row.is_active === 1,
-            isOnline: row.is_online === 1,
-            lastSeen: row.last_seen,
-            created_date: row.created_date,
-          }))
-        }));
       }
 
       return new Response(null, { status: 101, webSocket: client });
@@ -523,6 +504,24 @@ export class MaidCafeDO {
           ws.serializeAttachment(attachment);
 
           ws.send(JSON.stringify({ type: "AUTH_SUCCESS" }));
+
+          // Now safely send the initial administrative database state
+          const roomsList = this.query("SELECT * FROM rooms ORDER BY created_date DESC");
+          const guestsList = this.query("SELECT * FROM guest_users ORDER BY created_date DESC");
+          ws.send(JSON.stringify({
+            type: "ADMIN_INIT",
+            rooms: roomsList,
+            guests: guestsList.map(row => ({
+              id: row.id,
+              name: row.name,
+              roomId: row.room_id,
+              sessionToken: row.session_token,
+              isActive: row.is_active === 1,
+              isOnline: row.is_online === 1,
+              lastSeen: row.last_seen,
+              created_date: row.created_date,
+            }))
+          }));
         } else {
           ws.send(JSON.stringify({ type: "AUTH_FAILED" }));
         }
@@ -648,9 +647,13 @@ export default {
           return new Response("Expected Upgrade: websocket", { status: 426 });
         }
 
-        // Proxy WebSocket request directly to DO's /connect-ws endpoint
+        // Proxy WebSocket request directly to DO's /connect-ws endpoint safely copying headers
         const wsUrl = new URL(`/connect-ws?roomId=${roomId}&guestId=${guestId || ""}&role=${role}`, url.origin);
-        return await storeDo.fetch(new Request(wsUrl, request));
+        const wsHeaders = new Headers(request.headers);
+        const proxiedRequest = new Request(wsUrl, {
+          headers: wsHeaders,
+        });
+        return await storeDo.fetch(proxiedRequest);
       }
 
       // B: Check which REST API endpoints require Admin Auth
