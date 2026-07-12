@@ -36,43 +36,24 @@ export default function Admin() {
     }
   };
 
-  // REST load initially (rooms, members) as a starting point
-  const loadInitialData = useCallback(async () => {
-    if (!authed) return;
-    try {
-      const [roomList, memberList] = await Promise.all([
-        api.rooms.list(),
-        api.guests.list(),
-      ]);
-      setRooms(roomList);
-      setMembers(memberList);
-      setApiError(null);
-    } catch (err) {
-      console.error("Failed to load initial admin data:", err);
-      setApiError("バックエンドに接続できません。サーバーが起動しているか確認してください。");
-    } finally {
-      setLoading(false);
-    }
-  }, [authed]);
-
-  // Establish persistent always-on WebSocket connection for the admin console to receive reactive pushes
-  useEffect(() => {
+  // REST calls (api.rooms.list() & api.guests.list()) are completely deleted to ensure 0% REST polling load.
+  // We strictly rely on the initial state returned by the WebSocket server on connection open.
+  const connectWebSocket = useCallback(() => {
     if (!authed) return;
 
-    loadInitialData();
-
+    setLoading(true);
     const adminPassword = sessionStorage.getItem(STORAGE_KEYS.ADMIN_AUTH_PASSWORD) || "maid2024";
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    // Connect to global_store DO using a special admin query parameter
     const wsUrl = `${protocol}//${window.location.host}/api/ws?roomId=global_admin_room&role=admin`;
 
     const ws = new WebSocket(wsUrl);
     socketRef.current = ws;
 
     ws.onopen = () => {
-      console.log("[Admin WebSocket] Connected to global_store DO.");
-      // Register this socket as an admin inside DO using password authentication
+      console.log("[Admin WebSocket] Connected. Registering credentials.");
       ws.send(JSON.stringify({ type: "REGISTER_ADMIN", password: adminPassword }));
+      setApiError(null);
+      setLoading(false);
     };
 
     ws.onmessage = (event) => {
@@ -96,7 +77,6 @@ export default function Admin() {
         } else if (data.type === "GUEST_DELETED") {
           setMembers(prev => prev.filter(m => m.id !== data.guestId));
         } else if (data.type === "GUEST_UPDATE") {
-          // Fallback guest online update broadcasted room-wide
           setMembers(prev => prev.map(m => m.id === data.guestId ? { ...m, isOnline: data.isOnline, lastSeen: new Date().toISOString() } : m));
         }
       } catch (err) {
@@ -105,22 +85,28 @@ export default function Admin() {
     };
 
     ws.onclose = () => {
-      console.log("[Admin WebSocket] Connection closed.");
+      console.log("[Admin WebSocket] Connection closed. Retrying in 3 seconds.");
       socketRef.current = null;
+      // Auto-reconnect to maintain live status
+      setTimeout(connectWebSocket, 3000);
     };
 
     ws.onerror = (err) => {
       console.error("[Admin WebSocket] Connection error:", err);
+      setApiError("WebSocketに接続できません。バックエンドサーバーを確認してください。");
       socketRef.current = null;
     };
+  }, [authed]);
 
+  useEffect(() => {
+    connectWebSocket();
     return () => {
       if (socketRef.current) {
         socketRef.current.close();
         socketRef.current = null;
       }
     };
-  }, [authed, loadInitialData]);
+  }, [connectWebSocket]);
 
   const handleDeleteRoom = async (roomId) => {
     try {
@@ -164,8 +150,11 @@ export default function Admin() {
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={loadInitialData}
+              onClick={() => {
+                if (socketRef.current) socketRef.current.close(); // Forces manual connection reset and full re-init
+              }}
               className="p-2 text-gray-500 hover:text-gray-300 transition-colors rounded-lg hover:bg-gray-900"
+              title="WebSocket再接続"
             >
               <RefreshCw className="w-4 h-4" />
             </button>

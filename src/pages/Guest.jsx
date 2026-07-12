@@ -90,12 +90,11 @@ export default function Guest() {
       });
   }, [checkBlackoutLock, loadRoomPhase]);
 
-  // WebSocket connection & lifecycle management (WebSocket Hibernation / Always-on Connection Policy)
+  // WebSocket connection & lifecycle management (Always Connected cross all phases)
   useEffect(() => {
     if (!guestUser?.roomId || !room) return;
 
-    // Connect to WebSocket DO across ALL phases. We no longer discard or disconnect sockets
-    // in static phases. Cloudflare's WebSocket Hibernation handles resource state optimization automatically.
+    // Connect to WebSocket DO across ALL phases. Keep connection active so phase transitions (e.g. from WAITING) are captured instantly.
     if (!socketRef.current) {
       console.log(`[WebSocket] Establishing always-on connection. Initial phase: ${room.phase || "WAITING"}`);
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -139,7 +138,7 @@ export default function Guest() {
         socketRef.current = null;
       }
     };
-  }, [guestUser, room]);
+  }, [guestUser, room?.roomId]); // Bind to roomId instead of the entire room object to avoid trigger loops but preserve connectivity
 
   const handleCountdownEnd = useCallback(() => {
     if (token) localStorage.setItem(STORAGE_KEYS.BLACKOUT_LOCK(token), "true");
@@ -197,11 +196,10 @@ export default function Guest() {
     return <PhaseMenu guestName={guestUser?.name} />;
   }
 
-  // WAITING phase UI
+  // WAITING phase UI (Will update reactively now since WebSocket remains active)
   return (
     <PhaseWaiting
       guestName={guestUser?.name}
-      onReload={() => window.location.reload()}
     />
   );
 }
