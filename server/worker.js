@@ -1,5 +1,6 @@
 // Cloudflare Worker for Maid Cafe Menu System with SQLite Durable Objects & WebSockets.
 // 100% D1-Free Architecture. Persistently stores and broadcasts data entirely in the MaidCafeDO Durable Object.
+// Leverages Cloudflare's WebSocket Hibernation (冬眠) API. No in-memory arrays like `this.sessions`.
 
 // Helper to format JSON response
 function jsonResponse(data, status = 200) {
@@ -36,7 +37,6 @@ export class MaidCafeDO {
   constructor(state, env) {
     this.ctx = state;
     this.env = env;
-    this.sessions = []; // Active WebSocket clients: array of { ws, roomId, guestId }
 
     // Initialize SQLite tables inside Durable Object
     this.ctx.storage.sql.exec(`
@@ -94,15 +94,51 @@ export class MaidCafeDO {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // --- WEBSOCKET UPGRADE ---
+    // --- WEBSOCKET UPGRADE (DO-SIDE) ---
     if (path === "/connect-ws") {
       const roomId = url.searchParams.get("roomId");
       const guestId = url.searchParams.get("guestId");
+      const role = url.searchParams.get("role") || "guest";
 
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
 
-      await this.handleWebSocketSession(server, roomId, guestId);
+      // Register connection with WebSocket Hibernation API
+      this.ctx.acceptWebSocket(server);
+
+      // Attach metadata context to the accepted socket
+      server.serializeAttachment({ roomId, guestId, role });
+
+      // If guest user joins, mark online in the database
+      if (guestId && role === "guest") {
+        this.query("UPDATE guest_users SET is_online = 1, last_seen = ? WHERE id = ?", new Date().toISOString(), guestId);
+        this.broadcastToRoom(roomId, { type: "GUEST_UPDATE", guestId, isOnline: true });
+      }
+
+      // Initial state push (room state & whole database stats if admin joins)
+      const room = this.querySingle("SELECT * FROM rooms WHERE id = ?", roomId);
+      if (room) {
+        server.send(JSON.stringify({ type: "PHASE_UPDATE", phase: room.phase }));
+      }
+
+      if (role === "admin") {
+        const roomsList = this.query("SELECT * FROM rooms ORDER BY created_date DESC");
+        const guestsList = this.query("SELECT * FROM guest_users ORDER BY created_date DESC");
+        server.send(JSON.stringify({
+          type: "ADMIN_INIT",
+          rooms: roomsList,
+          guests: guestsList.map(row => ({
+            id: row.id,
+            name: row.name,
+            roomId: row.room_id,
+            sessionToken: row.session_token,
+            isActive: row.is_active === 1,
+            isOnline: row.is_online === 1,
+            lastSeen: row.last_seen,
+            created_date: row.created_date,
+          }))
+        }));
+      }
 
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -135,6 +171,13 @@ export class MaidCafeDO {
       const { id, name, phase } = body;
       const createdDate = new Date().toISOString();
       this.query("INSERT INTO rooms (id, name, phase, created_date) VALUES (?, ?, ?, ?)", id, name, phase, createdDate);
+
+      // Notify all active admin sockets about new room
+      this.broadcastToAdmins({
+        type: "ROOM_CREATED",
+        room: { id, name, phase, created_date: createdDate }
+      });
+
       return jsonResponse({ id, name, phase, created_date: createdDate }, 201);
     }
 
@@ -150,10 +193,15 @@ export class MaidCafeDO {
 
       this.query("UPDATE rooms SET name = ?, phase = ? WHERE id = ?", newName, newPhase, roomId);
 
-      // Broadcast phase update via active WebSockets of this room session
+      // Broadcast updates via WebSockets
       if (body.phase !== undefined) {
         this.broadcastToRoom(roomId, { type: "PHASE_UPDATE", phase: newPhase });
       }
+
+      this.broadcastToAdmins({
+        type: "ROOM_UPDATED",
+        room: { id: roomId, name: newName, phase: newPhase, created_date: current.created_date }
+      });
 
       return jsonResponse({
         id: roomId,
@@ -168,6 +216,13 @@ export class MaidCafeDO {
       const roomId = roomDetailMatch[1];
       this.query("DELETE FROM guest_users WHERE room_id = ?", roomId);
       this.query("DELETE FROM rooms WHERE id = ?", roomId);
+
+      // Notify all active admin sockets about deleted room
+      this.broadcastToAdmins({
+        type: "ROOM_DELETED",
+        roomId
+      });
+
       return new Response(null, { status: 204 });
     }
 
@@ -186,14 +241,13 @@ export class MaidCafeDO {
       }
 
       const enriched = rows.map(row => {
-        const isOnline = row.is_online === 1;
         return {
           id: row.id,
           name: row.name,
           roomId: row.room_id,
           sessionToken: row.session_token,
           isActive: row.is_active === 1,
-          isOnline: isOnline,
+          isOnline: row.is_online === 1,
           lastSeen: row.last_seen,
           created_date: row.created_date,
         };
@@ -213,7 +267,7 @@ export class MaidCafeDO {
       this.query("INSERT INTO guest_users (id, name, room_id, session_token, is_active, is_online, created_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
         id, name, roomId, sessionToken, activeVal, onlineVal, createdDate);
 
-      return jsonResponse({
+      const guestObj = {
         id,
         name,
         roomId,
@@ -222,7 +276,15 @@ export class MaidCafeDO {
         isOnline: onlineVal === 1,
         lastSeen: null,
         created_date: createdDate,
-      }, 201);
+      };
+
+      // Notify all admins about newly created guest
+      this.broadcastToAdmins({
+        type: "GUEST_CREATED",
+        guest: guestObj
+      });
+
+      return jsonResponse(guestObj, 201);
     }
 
     // PATCH /api/guests/:id
@@ -243,10 +305,7 @@ export class MaidCafeDO {
       this.query("UPDATE guest_users SET name = ?, room_id = ?, session_token = ?, is_active = ?, is_online = ?, last_seen = ? WHERE id = ?",
         newName, newRoomId, newSessionToken, newIsActive, newIsOnline, newLastSeen, guestId);
 
-      // Inform active WebSockets of changes in this room if needed
-      this.broadcastToRoom(newRoomId, { type: "GUEST_UPDATE", guestId, isOnline: newIsOnline === 1 });
-
-      return jsonResponse({
+      const updatedGuest = {
         id: guestId,
         name: newName,
         roomId: newRoomId,
@@ -255,13 +314,31 @@ export class MaidCafeDO {
         isOnline: newIsOnline === 1,
         lastSeen: newLastSeen,
         created_date: current.created_date,
+      };
+
+      // Inform active WebSockets of changes in this room if needed
+      this.broadcastToRoom(newRoomId, { type: "GUEST_UPDATE", guestId, isOnline: newIsOnline === 1 });
+
+      // Sync updated guest data to admins
+      this.broadcastToAdmins({
+        type: "GUEST_UPDATED",
+        guest: updatedGuest
       });
+
+      return jsonResponse(updatedGuest);
     }
 
     // DELETE /api/guests/:id
     if (guestDetailMatch && request.method === "DELETE") {
       const guestId = guestDetailMatch[1];
       this.query("DELETE FROM guest_users WHERE id = ?", guestId);
+
+      // Notify admins
+      this.broadcastToAdmins({
+        type: "GUEST_DELETED",
+        guestId
+      });
+
       return new Response(null, { status: 204 });
     }
 
@@ -332,55 +409,112 @@ export class MaidCafeDO {
     return new Response("Not Found", { status: 404 });
   }
 
-  async handleWebSocketSession(ws, roomId, guestId) {
-    ws.accept();
-    const session = { ws, roomId, guestId };
-    this.sessions.push(session);
+  // Cloudflare WebSocket Hibernation API message receiver
+  async webSocketMessage(ws, message) {
+    const attachment = ws.deserializeAttachment();
+    if (!attachment) return;
 
-    // Update guest user online status to online in database
-    if (guestId) {
-      this.query("UPDATE guest_users SET is_online = 1, last_seen = ? WHERE id = ?", new Date().toISOString(), guestId);
-    }
+    try {
+      const data = JSON.parse(message);
 
-    // Send the current phase on join
-    const room = this.querySingle("SELECT * FROM rooms WHERE id = ?", roomId);
-    if (room) {
-      ws.send(JSON.stringify({ type: "PHASE_UPDATE", phase: room.phase }));
-    }
+      // --- COMMAND HANDLER: SET_PHASE (WebSocket Management Trigger) ---
+      if (data.type === "SET_PHASE") {
+        const { roomId, phase, password } = data;
+        const expectedPassword = this.env.ADMIN_PASSWORD || "maid2024";
 
-    ws.addEventListener("message", async (msg) => {
-      // Manage custom guest action messages if required
-    });
+        if (password !== expectedPassword) {
+          ws.send(JSON.stringify({ type: "ERROR", message: "Unauthorized admin command" }));
+          return;
+        }
 
-    const cleanup = () => {
-      this.sessions = this.sessions.filter(s => s.ws !== ws);
-      if (guestId) {
-        this.query("UPDATE guest_users SET is_online = 0, last_seen = ? WHERE id = ?", new Date().toISOString(), guestId);
+        const current = this.querySingle("SELECT * FROM rooms WHERE id = ?", roomId);
+        if (!current) {
+          ws.send(JSON.stringify({ type: "ERROR", message: "Room not found" }));
+          return;
+        }
+
+        this.query("UPDATE rooms SET phase = ? WHERE id = ?", phase, roomId);
+
+        // Broadcast phase update via WebSocket to both general clients and admin dashboards
+        this.broadcastToRoom(roomId, { type: "PHASE_UPDATE", phase });
+
+        this.broadcastToAdmins({
+          type: "ROOM_UPDATED",
+          room: { id: roomId, name: current.name, phase, created_date: current.created_date }
+        });
       }
-    };
 
-    ws.addEventListener("close", cleanup);
-    ws.addEventListener("error", cleanup);
+      // --- COMMAND HANDLER: REGISTER_ADMIN ---
+      if (data.type === "REGISTER_ADMIN") {
+        const { password } = data;
+        const expectedPassword = this.env.ADMIN_PASSWORD || "maid2024";
+
+        if (password === expectedPassword) {
+          // Upgrade connection status of this socket to admin
+          attachment.role = "admin";
+          ws.serializeAttachment(attachment);
+
+          ws.send(JSON.stringify({ type: "AUTH_SUCCESS" }));
+        } else {
+          ws.send(JSON.stringify({ type: "AUTH_FAILED" }));
+        }
+      }
+
+    } catch (err) {
+      console.error("[WebSocket Message Error]", err);
+    }
   }
 
+  // Cloudflare WebSocket Hibernation API connection close hook
+  async webSocketClose(ws, code, reason, wasClean) {
+    const attachment = ws.deserializeAttachment();
+    if (attachment && attachment.guestId && attachment.role === "guest") {
+      this.query("UPDATE guest_users SET is_online = 0, last_seen = ? WHERE id = ?", new Date().toISOString(), attachment.guestId);
+      this.broadcastToRoom(attachment.roomId, { type: "GUEST_UPDATE", guestId: attachment.guestId, isOnline: false });
+    }
+  }
+
+  // Cloudflare WebSocket Hibernation API connection error hook
+  async webSocketError(ws, error) {
+    const attachment = ws.deserializeAttachment();
+    if (attachment && attachment.guestId && attachment.role === "guest") {
+      this.query("UPDATE guest_users SET is_online = 0, last_seen = ? WHERE id = ?", new Date().toISOString(), attachment.guestId);
+      this.broadcastToRoom(attachment.roomId, { type: "GUEST_UPDATE", guestId: attachment.guestId, isOnline: false });
+    }
+  }
+
+  // Broadcast to all sockets belonging to a specific roomId using Cloudflare's Hibernation getter
   broadcastToRoom(roomId, message) {
     const payload = JSON.stringify(message);
-    const activeSessions = [];
+    const sockets = this.ctx.getWebSockets();
 
-    this.sessions.forEach(session => {
-      if (session.roomId === roomId) {
+    for (const ws of sockets) {
+      const meta = ws.deserializeAttachment();
+      if (meta && meta.roomId === roomId) {
         try {
-          session.ws.send(payload);
-          activeSessions.push(session);
+          ws.send(payload);
         } catch {
-          // Closed socket
+          // Closed or dead connection
         }
-      } else {
-        activeSessions.push(session);
       }
-    });
+    }
+  }
 
-    this.sessions = activeSessions;
+  // Broadcast state changes exclusively to admin connections
+  broadcastToAdmins(message) {
+    const payload = JSON.stringify(message);
+    const sockets = this.ctx.getWebSockets();
+
+    for (const ws of sockets) {
+      const meta = ws.deserializeAttachment();
+      if (meta && meta.role === "admin") {
+        try {
+          ws.send(payload);
+        } catch {
+          // Closed or dead connection
+        }
+      }
+    }
   }
 }
 
@@ -435,6 +569,8 @@ export default {
       if (path === "/api/ws" && request.method === "GET") {
         const roomId = url.searchParams.get("roomId");
         const guestId = url.searchParams.get("guestId");
+        const role = url.searchParams.get("role") || "guest";
+
         if (!roomId) {
           return jsonResponse({ error: "roomId is required" }, 400);
         }
@@ -445,7 +581,7 @@ export default {
         }
 
         // Proxy WebSocket request directly to DO's /connect-ws endpoint
-        const wsUrl = new URL(`/connect-ws?roomId=${roomId}&guestId=${guestId || ""}`, url.origin);
+        const wsUrl = new URL(`/connect-ws?roomId=${roomId}&guestId=${guestId || ""}&role=${role}`, url.origin);
         return await storeDo.fetch(new Request(wsUrl, request));
       }
 
@@ -454,7 +590,7 @@ export default {
       const isFullGuests = path === "/api/guests" && !url.searchParams.get("sessionToken") && !url.searchParams.get("roomId");
 
       if (isMutation || isFullGuests) {
-        // Exempt public polling update (only guest PATCH to themselves for metadata, but we've transitioned to WebSockets so all guest updates are via WS or can be protected)
+        // Exempt public polling update (only guest PATCH to themselves for metadata)
         const isGuestPollingUpdate = path.match(/^\/api\/guests\/([a-zA-Z0-9-]+)$/) && request.method === "PATCH" && !request.headers.get("X-Admin-Password");
 
         if (!isGuestPollingUpdate) {

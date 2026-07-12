@@ -90,28 +90,16 @@ export default function Guest() {
       });
   }, [checkBlackoutLock, loadRoomPhase]);
 
-  // WebSocket connection & lifecycle management
+  // WebSocket connection & lifecycle management (WebSocket Hibernation / Always-on Connection Policy)
   useEffect(() => {
     if (!guestUser?.roomId || !room) return;
 
-    const currentPhase = room.phase || "WAITING";
-    const isInteractive = currentPhase === "MENU_OPEN" || currentPhase === "HACKING";
-
-    // PRINCIPLE: If in static phase (WAITING or BLACKOUT), do NOT establish or keep any WebSocket/polling connections.
-    if (!isInteractive) {
-      if (socketRef.current) {
-        console.log("[WebSocket] Phase is static. Closing active connection to minimize Worker load.");
-        socketRef.current.close();
-        socketRef.current = null;
-      }
-      return;
-    }
-
-    // Connect to WebSocket Durable Object if interactive and not already connected
+    // Connect to WebSocket DO across ALL phases. We no longer discard or disconnect sockets
+    // in static phases. Cloudflare's WebSocket Hibernation handles resource state optimization automatically.
     if (!socketRef.current) {
-      console.log(`[WebSocket] Entering interactive phase: ${currentPhase}. Connecting to RoomSession DO.`);
+      console.log(`[WebSocket] Establishing always-on connection. Initial phase: ${room.phase || "WAITING"}`);
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/api/ws?roomId=${guestUser.roomId}&guestId=${guestUser.id}`;
+      const wsUrl = `${protocol}//${window.location.host}/api/ws?roomId=${guestUser.roomId}&guestId=${guestUser.id}&role=guest`;
 
       const ws = new WebSocket(wsUrl);
       socketRef.current = ws;
@@ -151,7 +139,7 @@ export default function Guest() {
         socketRef.current = null;
       }
     };
-  }, [guestUser, room?.phase]);
+  }, [guestUser, room]);
 
   const handleCountdownEnd = useCallback(() => {
     if (token) localStorage.setItem(STORAGE_KEYS.BLACKOUT_LOCK(token), "true");
@@ -171,7 +159,7 @@ export default function Guest() {
     );
   }
 
-  // Beautiful Reload Prompt Screen if Room/Guest are not found or communication fails (Saves Worker Execution load)
+  // Beautiful Reload Prompt Screen if Room/Guest are not found or communication fails
   if (error) {
     return (
       <div className="min-h-screen cute-gradient flex items-center justify-center p-6 text-center">
@@ -209,7 +197,7 @@ export default function Guest() {
     return <PhaseMenu guestName={guestUser?.name} />;
   }
 
-  // WAITING phase UI with friendly manual reload button (Minimizes server/Worker calls completely)
+  // WAITING phase UI
   return (
     <PhaseWaiting
       guestName={guestUser?.name}
