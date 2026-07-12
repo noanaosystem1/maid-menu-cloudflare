@@ -181,6 +181,74 @@ export class MaidCafeDO {
       return jsonResponse({ id, name, phase, created_date: createdDate }, 201);
     }
 
+    // NEW ATOMIC COMPOSITE ENDPOINT: POST /api/rooms-with-guests
+    // Creates a room and registers users in one invocation.
+    if (path === "/api/rooms-with-guests" && request.method === "POST") {
+      const body = await request.json();
+      const { roomName, guests } = body;
+
+      if (!roomName) {
+        return jsonResponse({ error: "roomName is required" }, 400);
+      }
+
+      const roomId = crypto.randomUUID();
+      const createdDate = new Date().toISOString();
+
+      // Create Room
+      this.query("INSERT INTO rooms (id, name, phase, created_date) VALUES (?, ?, 'WAITING', ?)", roomId, roomName, createdDate);
+
+      const registeredGuests = [];
+      if (Array.isArray(guests)) {
+        for (const guestName of guests) {
+          if (!guestName || typeof guestName !== "string") continue;
+
+          const guestId = crypto.randomUUID();
+          const sessionToken = crypto.randomUUID(); // Unique v4 token
+
+          this.query(
+            "INSERT INTO guest_users (id, name, room_id, session_token, is_active, is_online, created_date) VALUES (?, ?, ?, ?, 1, 0, ?)",
+            guestId, guestName, roomId, sessionToken, createdDate
+          );
+
+          // Build URL using request's origin
+          const guestUrl = `${url.origin}/guest?token=${sessionToken}`;
+
+          registeredGuests.push({
+            id: guestId,
+            name: guestName,
+            roomId,
+            sessionToken,
+            isActive: true,
+            isOnline: false,
+            lastSeen: null,
+            created_date: createdDate,
+            guestUrl
+          });
+        }
+      }
+
+      const roomObj = { id: roomId, name: roomName, phase: "WAITING", created_date: createdDate };
+
+      // Broadcast creation events to active admin sockets
+      this.broadcastToAdmins({
+        type: "ROOM_CREATED",
+        room: roomObj
+      });
+
+      for (const g of registeredGuests) {
+        this.broadcastToAdmins({
+          type: "GUEST_CREATED",
+          guest: g
+        });
+      }
+
+      return jsonResponse({
+        ok: true,
+        room: roomObj,
+        guests: registeredGuests
+      }, 201);
+    }
+
     // PATCH /api/rooms/:id
     if (roomDetailMatch && request.method === "PATCH") {
       const roomId = roomDetailMatch[1];
@@ -590,7 +658,7 @@ export default {
       const isFullGuests = path === "/api/guests" && !url.searchParams.get("sessionToken") && !url.searchParams.get("roomId");
 
       if (isMutation || isFullGuests) {
-        // Exempt public polling update (only guest PATCH to themselves for metadata)
+        // Exempt public polling update
         const isGuestPollingUpdate = path.match(/^\/api\/guests\/([a-zA-Z0-9-]+)$/) && request.method === "PATCH" && !request.headers.get("X-Admin-Password");
 
         if (!isGuestPollingUpdate) {

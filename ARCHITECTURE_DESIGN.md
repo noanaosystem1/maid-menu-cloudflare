@@ -8,6 +8,8 @@
 
 本システムは、Cloudflare Workers のサーバリソースおよびコスト削減を追求した**「100% D1-Free（外部RDB非依存）エッジネイティブ・アーキテクチャ」**を採用しています。Durable Objects 内蔵の SQLite データベースに加え、接続管理には **Cloudflare WebSocket Hibernation（冬眠）API** を全面採用。全ての更新トリガーを WebSocket 接続へ寄せ、管理画面の周期ポーリングを廃止（完全WebSocket化）することで、リクエスト消費量を極限まで抑制します。
 
+さらに、外部自動化システムや外部アプリからの要求に省コストで対応するため、**1回の Worker 起動だけで「部屋作成」「複数ゲスト登録」「招待URLの自動一括生成」をアトミックに行える複合 API エンドポイント**を完備しています。
+
 ```
                     ┌─────────────────────────────────────────────────────────┐
                     │                    Cloudflare Edge                      │
@@ -36,14 +38,17 @@
    - HTTP/HTTPS リクエストのフロントエンド側プロキシとして動作。
    - `OPTIONS` メソッドによるプリフライト（CORS）要求をエッジで瞬時に処理。
    - `/api` 以外のパスに対するリクエストを `Cloudflare ASSETS` (静的ファイル配信) にルーティング（フォールバック付き）。
+   - 管理者認証 (`ADMIN_PASSWORD` ヘッダー照合) を行い、不正なミューテーション操作をブロック。
    - メインのデータストアかつ WebSocket サーバーである Durable Object（`MaidCafeDO`）への WebSocket アップグレードを仲介。
-2. **Durable Objects (`MaidCafeDO` / `server/worker.js` 内):**
+2. **Durable Objects (`MaidCafeDO` / `server/worker.js`):**
    - **状態（State）の永続化と一貫性の担保:** インメモリ SQLite データベースを内包し、ディスク永続化と超高速アクセスを同時に実現。
    - **WebSocket 冬眠 (Hibernation) API によるコネクション管理:**
      - メモリ（JavaScript変数空間）上のソケット保持用配列（`this.sessions`）を完全に排除。
      - Cloudflare 独自の `state.acceptWebSocket(ws)` API に接続管理を全面的に委ねます。
      - 接続中ソケットに関連情報（`roomId`, `guestId`, `role` [admin/guest] 等）を `serializeAttachment()` で暗黙的に添付。
      - 通信がない非アクティブ時は、オブジェクトインスタンスが自動的に「冬眠（Hibernation）」して稼働時間（GB-秒枠）の消費をゼロ化。メッセージ到着時のみ自動でメモリ上に復帰し起動します。
+   - **原子的一括処理（Composite Endpoint）の実装:**
+     - `POST /api/rooms-with-guests` が送信された際、SQLite トランザクション感覚で、一気にルームのインサート、および対象全員のランダム一意トークン（sessionToken）発行とユーザー登録を行い、即座にゲスト専用URL（`guestUrl`）付きの完全データを返却します。
 3. **フロントエンド SPA (`src/`):**
    - React + Vite + Tailwind CSS を用いた、シングルページアプリケーション。
    - ゲスト画面だけでなく、**管理画面（`Admin.jsx`）も完全WebSocket常時接続に統一**し、周期HTTPポーリング（`setInterval`）を完全に廃止しました。
