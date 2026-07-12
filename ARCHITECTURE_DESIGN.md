@@ -47,8 +47,9 @@
      - Cloudflare 独自の `state.acceptWebSocket(ws)` API に接続管理を全面的に委ねます。
      - 接続中ソケットに関連情報（`roomId`, `guestId`, `role` [admin/guest] 等）を `serializeAttachment()` で暗黙的に添付。
      - 通信がない非アクティブ時は、オブジェクトインスタンスが自動的に「冬眠（Hibernation）」して稼働時間（GB-秒枠）の消費をゼロ化。メッセージ到着時のみ自動でメモリ上に復帰し起動します。
-   - **原子的一括処理（Composite Endpoint）の実装:**
-     - `POST /api/rooms-with-guests` が送信された際、SQLite トランザクション感覚で、一気にルームのインサート、および対象全員のランダム一意トークン（sessionToken）発行とユーザー登録を行い、即座にゲスト専用URL（`guestUrl`）付きの完全データを返却します。
+   - **原子的一括処理（Composite Endpoint）および疎結合 API の実装:**
+     - **一括登録:** `POST /api/rooms-with-guests` が送信された際、SQLite トランザクション感覚で一括で部屋作成と全員のユーザー登録を行い、即座にURL付きデータを返却します。
+     - **分離（疎結合）登録:** 外部システムからの疎結合運用に対応するため、`POST /api/rooms`（部屋単体作成・UUID返却）と `POST /api/guests`（取得した部屋IDに基づいた任意のタイミングでのゲスト個別追加＆ゲストURL即時発行）に分離した設計を完備しています。これにより、1回のワーカー消費で確実な非同期管理フローが実現します。
 3. **フロントエンド SPA (`src/`):**
    - React + Vite + Tailwind CSS を用いた、シングルページアプリケーション。
    - ゲスト画面だけでなく、**管理画面（`Admin.jsx`）も完全WebSocket常時接続に統一**し、周期HTTPポーリング（`setInterval`）を完全に廃止しました。

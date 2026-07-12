@@ -150,16 +150,23 @@ export class MaidCafeDO {
     if (path === "/api/rooms" && request.method === "POST") {
       const body = await request.json();
       const { id, name, phase } = body;
+
+      if (!name) {
+        return jsonResponse({ error: "name is required" }, 400);
+      }
+
+      const roomId = id || crypto.randomUUID();
+      const roomPhase = phase || "WAITING";
       const createdDate = new Date().toISOString();
-      this.query("INSERT INTO rooms (id, name, phase, created_date) VALUES (?, ?, ?, ?)", id, name, phase, createdDate);
+      this.query("INSERT INTO rooms (id, name, phase, created_date) VALUES (?, ?, ?, ?)", roomId, name, roomPhase, createdDate);
 
       // Notify all active admin sockets about new room
       this.broadcastToAdmins({
         type: "ROOM_CREATED",
-        room: { id, name, phase, created_date: createdDate }
+        room: { id: roomId, name, phase: roomPhase, created_date: createdDate }
       });
 
-      return jsonResponse({ id, name, phase, created_date: createdDate }, 201);
+      return jsonResponse({ id: roomId, name, phase: roomPhase, created_date: createdDate }, 201);
     }
 
     // NEW ATOMIC COMPOSITE ENDPOINT: POST /api/rooms-with-guests
@@ -308,13 +315,23 @@ export class MaidCafeDO {
     // POST /api/guests
     if (path === "/api/guests" && request.method === "POST") {
       const body = await request.json();
-      const { id, name, roomId, sessionToken, isActive, isOnline } = body;
+      let { id, name, roomId, sessionToken, isActive, isOnline } = body;
+
+      if (!name || !roomId) {
+        return jsonResponse({ error: "name and roomId are required" }, 400);
+      }
+
+      if (!id) id = crypto.randomUUID();
+      if (!sessionToken) sessionToken = crypto.randomUUID();
+
       const createdDate = new Date().toISOString();
       const activeVal = isActive !== false ? 1 : 0;
       const onlineVal = isOnline ? 1 : 0;
 
       this.query("INSERT INTO guest_users (id, name, room_id, session_token, is_active, is_online, created_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
         id, name, roomId, sessionToken, activeVal, onlineVal, createdDate);
+
+      const guestUrl = `${url.origin}/guest?token=${sessionToken}`;
 
       const guestObj = {
         id,
@@ -325,6 +342,7 @@ export class MaidCafeDO {
         isOnline: onlineVal === 1,
         lastSeen: null,
         created_date: createdDate,
+        guestUrl
       };
 
       // Notify all admins about newly created guest
