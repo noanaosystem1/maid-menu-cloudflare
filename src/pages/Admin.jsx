@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Plus, RefreshCw, LogOut } from "lucide-react";
 import { api } from "@/api/client";
 import { STORAGE_KEYS } from "@/lib/constants";
@@ -18,42 +18,95 @@ export default function Admin() {
   const [activeTab, setActiveTab] = useState("rooms"); // "rooms" | "menu"
   const [apiError, setApiError] = useState(null);
 
+  const socketRef = useRef(null);
+
   // Check session auth
   useEffect(() => {
     const auth = sessionStorage.getItem(STORAGE_KEYS.ADMIN_AUTH);
     if (auth === "1") setAuthed(true);
   }, []);
 
-  const loadData = useCallback(async () => {
-    if (!authed) return;
-    try {
-      const [roomList, memberList] = await Promise.all([
-        api.rooms.list(),
-        api.guests.list(),
-      ]);
-      setRooms(roomList);
-      setMembers(memberList);
-      setApiError(null);
-    } catch (err) {
-      console.error("Failed to load admin data:", err);
-      setApiError("バックエンドに接続できません。サーバーが起動しているか確認してください。");
-    } finally {
-      setLoading(false);
-    }
-  }, [authed]);
-
-  useEffect(() => {
-    loadData();
-    if (!authed) return;
-    const interval = setInterval(loadData, 1000);
-    return () => clearInterval(interval);
-  }, [loadData, authed]);
-
   const handleLogout = () => {
     sessionStorage.removeItem(STORAGE_KEYS.ADMIN_AUTH);
     sessionStorage.removeItem(STORAGE_KEYS.ADMIN_AUTH_PASSWORD);
     setAuthed(false);
+    if (socketRef.current) {
+      socketRef.current.close();
+      socketRef.current = null;
+    }
   };
+
+  // REST calls (api.rooms.list() & api.guests.list()) are completely deleted to ensure 0% REST polling load.
+  // We strictly rely on the initial state returned by the WebSocket server on connection open.
+  const connectWebSocket = useCallback(() => {
+    if (!authed) return;
+
+    setLoading(true);
+    const adminPassword = sessionStorage.getItem(STORAGE_KEYS.ADMIN_AUTH_PASSWORD) || "maid2024";
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${window.location.host}/api/ws?roomId=global_admin_room&role=admin`;
+
+    const ws = new WebSocket(wsUrl);
+    socketRef.current = ws;
+
+    ws.onopen = () => {
+      console.log("[Admin WebSocket] Connected. Registering credentials.");
+      ws.send(JSON.stringify({ type: "REGISTER_ADMIN", password: adminPassword }));
+      setApiError(null);
+      setLoading(false);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log("[Admin WebSocket] Received payload:", data);
+
+        if (data.type === "ADMIN_INIT") {
+          if (data.rooms) setRooms(data.rooms);
+          if (data.guests) setMembers(data.guests);
+        } else if (data.type === "ROOM_CREATED") {
+          setRooms(prev => [data.room, ...prev]);
+        } else if (data.type === "ROOM_UPDATED") {
+          setRooms(prev => prev.map(r => r.id === data.room.id ? data.room : r));
+        } else if (data.type === "ROOM_DELETED") {
+          setRooms(prev => prev.filter(r => r.id !== data.roomId));
+        } else if (data.type === "GUEST_CREATED") {
+          setMembers(prev => [data.guest, ...prev]);
+        } else if (data.type === "GUEST_UPDATED") {
+          setMembers(prev => prev.map(m => m.id === data.guest.id ? data.guest : m));
+        } else if (data.type === "GUEST_DELETED") {
+          setMembers(prev => prev.filter(m => m.id !== data.guestId));
+        } else if (data.type === "GUEST_UPDATE") {
+          setMembers(prev => prev.map(m => m.id === data.guestId ? { ...m, isOnline: data.isOnline, lastSeen: new Date().toISOString() } : m));
+        }
+      } catch (err) {
+        console.error("[Admin WebSocket] Failed to parse message:", err);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("[Admin WebSocket] Connection closed. Retrying in 3 seconds.");
+      socketRef.current = null;
+      // Auto-reconnect to maintain live status
+      setTimeout(connectWebSocket, 3000);
+    };
+
+    ws.onerror = (err) => {
+      console.error("[Admin WebSocket] Connection error:", err);
+      setApiError("WebSocketに接続できません。バックエンドサーバーを確認してください。");
+      socketRef.current = null;
+    };
+  }, [authed]);
+
+  useEffect(() => {
+    connectWebSocket();
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.close();
+        socketRef.current = null;
+      }
+    };
+  }, [connectWebSocket]);
 
   const handleDeleteRoom = async (roomId) => {
     try {
@@ -70,13 +123,20 @@ export default function Admin() {
   }
 
   if (selectedRoomId) {
-    return <AdminRoomDetail roomId={selectedRoomId} onBack={() => setSelectedRoomId(null)} />;
+    return (
+      <AdminRoomDetail
+        roomId={selectedRoomId}
+        rooms={rooms}
+        members={members}
+        socket={socketRef.current}
+        onBack={() => setSelectedRoomId(null)}
+      />
+    );
   }
 
   const getMembersForRoom = (roomId) => members.filter((m) => m.roomId === roomId);
   const getOnlineCountForRoom = (roomId) => {
-    const now = Date.now();
-    return members.filter((m) => m.roomId === roomId && m.isOnline && m.lastSeen && (now - new Date(m.lastSeen).getTime()) < 10000).length;
+    return members.filter((m) => m.roomId === roomId && m.isOnline).length;
   };
 
   return (
@@ -86,12 +146,15 @@ export default function Admin() {
         <div className="max-w-2xl mx-auto flex items-center justify-between">
           <div>
             <h1 className="text-white font-bold text-lg">制御パネル</h1>
-            <p className="text-gray-600 text-xs mt-0.5">狂気メイド喫茶 Admin Console</p>
+            <p className="text-gray-600 text-xs mt-0.5">狂気メイド喫茶 Admin Console (WebSocket Live)</p>
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={loadData}
+              onClick={() => {
+                if (socketRef.current) socketRef.current.close(); // Forces manual connection reset and full re-init
+              }}
               className="p-2 text-gray-500 hover:text-gray-300 transition-colors rounded-lg hover:bg-gray-900"
+              title="WebSocket再接続"
             >
               <RefreshCw className="w-4 h-4" />
             </button>
@@ -140,7 +203,7 @@ export default function Admin() {
               {[
                 { label: "総Room数", value: rooms.length, color: "text-white" },
                 { label: "総ゲスト数", value: members.length, color: "text-pink-400" },
-                { label: "オンライン", value: members.filter((m) => m.isOnline && m.lastSeen && (Date.now() - new Date(m.lastSeen).getTime()) < 10000).length, color: "text-green-400" },
+                { label: "オンライン", value: members.filter((m) => m.isOnline).length, color: "text-green-400" },
               ].map((stat) => (
                 <div key={stat.label} className="bg-gray-900 rounded-xl border border-gray-800 p-4 text-center">
                   <p className={`text-2xl font-bold ${stat.color}`}>{stat.value}</p>

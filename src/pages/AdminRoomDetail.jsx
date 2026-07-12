@@ -1,76 +1,64 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState } from "react";
 import { ArrowLeft, Plus, RefreshCw } from "lucide-react";
 import { api } from "@/api/client";
-import { PHASES, PHASE_LABELS, PHASE_COLORS } from "@/lib/constants";
+import { STORAGE_KEYS, PHASES, PHASE_LABELS, PHASE_COLORS } from "@/lib/constants";
 import PhaseControls from "@/components/admin/PhaseControls";
 import MemberList from "@/components/admin/MemberList";
 import AddMemberModal from "@/components/admin/AddMemberModal";
 import UrlExportPanel from "@/components/admin/UrlExportPanel";
 
-export default function AdminRoomDetail({ roomId, onBack }) {
-  const [room, setRoom] = useState(null);
-  const [members, setMembers] = useState([]);
-  const [loading, setLoading] = useState(true);
+export default function AdminRoomDetail({ roomId, rooms, members, socket, onBack }) {
   const [advancing, setAdvancing] = useState(false);
   const [showAddMember, setShowAddMember] = useState(false);
 
-  const loadData = useCallback(async () => {
-    try {
-      const [room, users] = await Promise.all([
-        api.rooms.get(roomId),
-        api.guests.list({ roomId }),
-      ]);
-      if (room) setRoom(room);
-      setMembers(users);
-    } catch (err) {
-      console.error("Failed to load room detail:", err);
-    } finally {
-      setLoading(false);
+  // Find the room from the shared reactive state
+  const room = rooms.find(r => r.id === roomId);
+  // Filter members from the shared reactive state
+  const roomMembers = members.filter(m => m.roomId === roomId);
+
+  const sendPhaseCommand = (targetPhase) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      alert("WebSocket接続が確立されていません。画面を更新してください。");
+      return;
     }
-  }, [roomId]);
+    const adminPassword = sessionStorage.getItem(STORAGE_KEYS.ADMIN_AUTH_PASSWORD) || "maid2024";
+    setAdvancing(true);
 
-  useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 1000);
-    return () => clearInterval(interval);
-  }, [loadData]);
+    // Send phase transition payload directly over WebSocket with authorization password
+    socket.send(JSON.stringify({
+      type: "SET_PHASE",
+      roomId,
+      phase: targetPhase,
+      password: adminPassword
+    }));
 
-  const handleAdvance = async () => {
+    // Mimic synchronous UI feedback, the DO will broadcast the official updated state
+    setTimeout(() => {
+      setAdvancing(false);
+    }, 500);
+  };
+
+  const handleAdvance = () => {
     if (!room) return;
     const currentIndex = PHASES.indexOf(room.phase);
     if (currentIndex >= PHASES.length - 1) return;
     const nextPhase = PHASES[currentIndex + 1];
-    setAdvancing(true);
-    const updated = await api.rooms.update(room.id, { phase: nextPhase });
-    setRoom(updated);
-    setAdvancing(false);
+    sendPhaseCommand(nextPhase);
   };
 
-  const handleReset = async () => {
+  const handleReset = () => {
     if (!confirm("このRoomをWAITINGにリセットしますか？")) return;
-    setAdvancing(true);
-    const updated = await api.rooms.update(room.id, { phase: "WAITING" });
-    setRoom(updated);
-    setAdvancing(false);
+    sendPhaseCommand("WAITING");
   };
 
   const handleDeleteMember = async (memberId) => {
     try {
       await api.guests.delete(memberId);
-      setMembers((prev) => prev.filter((m) => m.id !== memberId));
     } catch (err) {
       console.error("Failed to delete member:", err);
       alert("メンバー削除に失敗しました。");
     }
   };
-
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
-        <div className="w-8 h-8 border-4 border-gray-800 border-t-pink-500 rounded-full animate-spin" />
-      </div>
-    );
-  }
 
   if (!room) {
     return (
@@ -95,10 +83,10 @@ export default function AdminRoomDetail({ roomId, onBack }) {
               <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold text-white ${PHASE_COLORS[room.phase]}`}>
                 {PHASE_LABELS[room.phase]}
               </span>
-              <span className="text-gray-600 text-xs">{members.length}名</span>
+              <span className="text-gray-600 text-xs">{roomMembers.length}名</span>
             </div>
           </div>
-          <button onClick={loadData} className="p-2 text-gray-500 hover:text-gray-300 transition-colors rounded-lg hover:bg-gray-900">
+          <button onClick={() => window.location.reload()} className="p-2 text-gray-500 hover:text-gray-300 transition-colors rounded-lg hover:bg-gray-900">
             <RefreshCw className="w-4 h-4" />
           </button>
         </div>
@@ -126,11 +114,11 @@ export default function AdminRoomDetail({ roomId, onBack }) {
           </button>
         </div>
 
-        <MemberList members={members} onRefresh={loadData} onDeleteMember={handleDeleteMember} />
+        <MemberList members={roomMembers} onRefresh={() => {}} onDeleteMember={handleDeleteMember} />
 
         {/* URL export */}
-        {members.length > 0 && (
-          <UrlExportPanel members={members} />
+        {roomMembers.length > 0 && (
+          <UrlExportPanel members={roomMembers} />
         )}
       </div>
 
@@ -139,7 +127,7 @@ export default function AdminRoomDetail({ roomId, onBack }) {
         <AddMemberModal
           room={room}
           onClose={() => setShowAddMember(false)}
-          onAdded={loadData}
+          onAdded={() => {}}
         />
       )}
     </div>
