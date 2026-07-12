@@ -42,10 +42,11 @@
    - メインのデータストアかつ WebSocket サーバーである Durable Object（`MaidCafeDO`）への WebSocket アップグレードを仲介。
 2. **Durable Objects (`MaidCafeDO` / `server/worker.js`):**
    - **状態（State）の永続化と一貫性の担保:** インメモリ SQLite データベースを内包し、ディスク永続化と超高速アクセスを同時に実現。
-   - **WebSocket 冬眠 (Hibernation) API によるコネクション管理:**
+     - **WebSocket 冬眠 (Hibernation) API によるコネクション管理 (最重要・ワーカー不消費設計):**
      - メモリ（JavaScript変数空間）上のソケット保持用配列（`this.sessions`）を完全に排除。
      - Cloudflare 独自の `state.acceptWebSocket(ws)` API に接続管理を全面的に委ねます。
      - 接続中ソケットに関連情報（`roomId`, `guestId`, `role` [admin/guest] 等）を `serializeAttachment()` で暗黙的に添付。
+       - **ワーカー消費ゼロの直通データ書き換え:** WebSocket 接続確立後のデータ変更メッセージ（`SET_PHASE` や `REGISTER_ADMIN` 等）は、エッジのメイン Worker の `fetch()` ハンドラを一切経由せず、**Durable Object の `webSocketMessage` ハンドラへ直接配信されてインメモリ SQLite に書き込まれます**。これにより、実行時の Workers 1日10万回リクエスト消費を「完全にゼロ（不消費）」に抑える極限の省コスト設計を実現しています。
      - 通信がない非アクティブ時は、オブジェクトインスタンスが自動的に「冬眠（Hibernation）」して稼働時間（GB-秒枠）の消費をゼロ化。メッセージ到着時のみ自動でメモリ上に復帰し起動します。
    - **原子的一括処理（Composite Endpoint）および疎結合 API の実装:**
      - **一括登録:** `POST /api/rooms-with-guests` が送信された際、SQLite トランザクション感覚で一括で部屋作成と全員のユーザー登録を行い、即座にURL付きデータを返却します。
