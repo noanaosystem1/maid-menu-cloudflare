@@ -1,5 +1,6 @@
 // Cloudflare Worker for Maid Cafe Menu System with SQLite Durable Objects & WebSockets.
-// 100% D1-Free Architecture. Persistently stores and broadcasts data entirely in the MaidCafeDO Durable Object.
+// 100% D1-Free Architecture with write-through in-memory Map caching.
+// Minimizes SQL reads to exactly ONCE on DO activation, and writes only when data changes.
 // Leverages Cloudflare's WebSocket Hibernation (冬眠) API. No in-memory arrays like `this.sessions`.
 
 // Helper to format JSON response
@@ -37,6 +38,12 @@ export class MaidCafeDO {
   constructor(state, env) {
     this.ctx = state;
     this.env = env;
+
+    // Cache states
+    this.isCacheLoaded = false;
+    this.roomsCache = new Map();
+    this.guestsCache = new Map();
+    this.menuItemsCache = new Map();
 
     // Initialize SQLite tables inside Durable Object
     this.ctx.storage.sql.exec(`
@@ -90,7 +97,35 @@ export class MaidCafeDO {
     return arr.length > 0 ? arr[0] : null;
   }
 
+  // Lazy-loader to read SQLite exactly ONCE on activation
+  ensureCacheLoaded() {
+    if (this.isCacheLoaded) return;
+
+    // Read Rooms
+    const roomsList = this.query("SELECT * FROM rooms");
+    for (const r of roomsList) {
+      this.roomsCache.set(r.id, r);
+    }
+
+    // Read Guests
+    const guestsList = this.query("SELECT * FROM guest_users");
+    for (const g of guestsList) {
+      this.guestsCache.set(g.id, g);
+    }
+
+    // Read Menu Items
+    const menuItemsList = this.query("SELECT * FROM menu_items");
+    for (const m of menuItemsList) {
+      this.menuItemsCache.set(m.id, m);
+    }
+
+    this.isCacheLoaded = true;
+    console.log(`[Cache Hydrated] Loaded ${this.roomsCache.size} rooms, ${this.guestsCache.size} guests, ${this.menuItemsCache.size} menu items from SQLite.`);
+  }
+
   async fetch(request) {
+    this.ensureCacheLoaded();
+
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -109,14 +144,23 @@ export class MaidCafeDO {
       // Attach metadata context to the accepted socket
       server.serializeAttachment({ roomId, guestId, role });
 
-      // If guest user joins, mark online in the database
+      // If guest user joins, mark online in SQLite and Cache
       if (guestId && role === "guest") {
-        this.query("UPDATE guest_users SET is_online = 1, last_seen = ? WHERE id = ?", new Date().toISOString(), guestId);
+        const timestamp = new Date().toISOString();
+        this.query("UPDATE guest_users SET is_online = 1, last_seen = ? WHERE id = ?", timestamp, guestId);
+
+        const cachedGuest = this.guestsCache.get(guestId);
+        if (cachedGuest) {
+          cachedGuest.is_online = 1;
+          cachedGuest.last_seen = timestamp;
+          this.guestsCache.set(guestId, cachedGuest);
+        }
+
         this.broadcastToRoom(roomId, { type: "GUEST_UPDATE", guestId, isOnline: true });
       }
 
-      // Initial state push (room state)
-      const room = this.querySingle("SELECT * FROM rooms WHERE id = ?", roomId);
+      // Initial state push (room state) from CACHE - 0% SQL read load!
+      const room = this.roomsCache.get(roomId);
       if (room) {
         server.send(JSON.stringify({ type: "PHASE_UPDATE", phase: room.phase }));
       }
@@ -124,26 +168,27 @@ export class MaidCafeDO {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // --- REST API ENDPOINTS PROXIED TO DO SQLITE ---
+    // --- REST API ENDPOINTS POWERED BY CACHE ---
 
     // GET /api/health
     if (path === "/api/health") {
-      return jsonResponse({ ok: true, database: "durable_objects_sqlite" });
+      return jsonResponse({ ok: true, database: "durable_objects_sqlite_cached" });
     }
 
     // GET /api/rooms
     if (path === "/api/rooms" && request.method === "GET") {
-      const rows = this.query("SELECT * FROM rooms ORDER BY created_date DESC");
-      return jsonResponse(rows);
+      const list = Array.from(this.roomsCache.values())
+        .sort((a, b) => b.created_date.localeCompare(a.created_date));
+      return jsonResponse(list);
     }
 
     // GET /api/rooms/:id
     const roomDetailMatch = path.match(/^\/api\/rooms\/([a-zA-Z0-9-]+)$/);
     if (roomDetailMatch && request.method === "GET") {
       const roomId = roomDetailMatch[1];
-      const row = this.querySingle("SELECT * FROM rooms WHERE id = ?", roomId);
-      if (!row) return jsonResponse({ error: "Room not found" }, 404);
-      return jsonResponse(row);
+      const room = this.roomsCache.get(roomId);
+      if (!room) return jsonResponse({ error: "Room not found" }, 404);
+      return jsonResponse(room);
     }
 
     // POST /api/rooms
@@ -158,19 +203,24 @@ export class MaidCafeDO {
       const roomId = id || crypto.randomUUID();
       const roomPhase = phase || "WAITING";
       const createdDate = new Date().toISOString();
+
+      // Write-Through: Update SQLite
       this.query("INSERT INTO rooms (id, name, phase, created_date) VALUES (?, ?, ?, ?)", roomId, name, roomPhase, createdDate);
+
+      // Write-Through: Update Cache
+      const roomObj = { id: roomId, name, phase: roomPhase, created_date: createdDate };
+      this.roomsCache.set(roomId, roomObj);
 
       // Notify all active admin sockets about new room
       this.broadcastToAdmins({
         type: "ROOM_CREATED",
-        room: { id: roomId, name, phase: roomPhase, created_date: createdDate }
+        room: roomObj
       });
 
-      return jsonResponse({ id: roomId, name, phase: roomPhase, created_date: createdDate }, 201);
+      return jsonResponse(roomObj, 201);
     }
 
     // NEW ATOMIC COMPOSITE ENDPOINT: POST /api/rooms-with-guests
-    // Creates a room and registers users in one invocation.
     if (path === "/api/rooms-with-guests" && request.method === "POST") {
       const body = await request.json();
       const { roomName, guests } = body;
@@ -182,8 +232,12 @@ export class MaidCafeDO {
       const roomId = crypto.randomUUID();
       const createdDate = new Date().toISOString();
 
-      // Create Room
+      // SQLite Write
       this.query("INSERT INTO rooms (id, name, phase, created_date) VALUES (?, ?, 'WAITING', ?)", roomId, roomName, createdDate);
+
+      // Cache Write
+      const roomObj = { id: roomId, name: roomName, phase: "WAITING", created_date: createdDate };
+      this.roomsCache.set(roomId, roomObj);
 
       const registeredGuests = [];
       if (Array.isArray(guests)) {
@@ -191,14 +245,27 @@ export class MaidCafeDO {
           if (!guestName || typeof guestName !== "string") continue;
 
           const guestId = crypto.randomUUID();
-          const sessionToken = crypto.randomUUID(); // Unique v4 token
+          const sessionToken = crypto.randomUUID();
 
+          // SQLite Write
           this.query(
             "INSERT INTO guest_users (id, name, room_id, session_token, is_active, is_online, created_date) VALUES (?, ?, ?, ?, 1, 0, ?)",
             guestId, guestName, roomId, sessionToken, createdDate
           );
 
-          // Build URL using request's origin
+          // Cache Write
+          const guestRow = {
+            id: guestId,
+            name: guestName,
+            room_id: roomId,
+            session_token: sessionToken,
+            is_active: 1,
+            is_online: 0,
+            last_seen: null,
+            created_date: createdDate
+          };
+          this.guestsCache.set(guestId, guestRow);
+
           const guestUrl = `${url.origin}/guest?token=${sessionToken}`;
 
           registeredGuests.push({
@@ -214,8 +281,6 @@ export class MaidCafeDO {
           });
         }
       }
-
-      const roomObj = { id: roomId, name: roomName, phase: "WAITING", created_date: createdDate };
 
       // Broadcast creation events to active admin sockets
       this.broadcastToAdmins({
@@ -241,13 +306,23 @@ export class MaidCafeDO {
     if (roomDetailMatch && request.method === "PATCH") {
       const roomId = roomDetailMatch[1];
       const body = await request.json();
-      const current = this.querySingle("SELECT * FROM rooms WHERE id = ?", roomId);
+      const current = this.roomsCache.get(roomId);
       if (!current) return jsonResponse({ error: "Room not found" }, 404);
 
       const newName = body.name !== undefined ? body.name : current.name;
       const newPhase = body.phase !== undefined ? body.phase : current.phase;
 
+      // SQLite Write
       this.query("UPDATE rooms SET name = ?, phase = ? WHERE id = ?", newName, newPhase, roomId);
+
+      // Cache Write
+      const updatedRoom = {
+        id: roomId,
+        name: newName,
+        phase: newPhase,
+        created_date: current.created_date,
+      };
+      this.roomsCache.set(roomId, updatedRoom);
 
       // Broadcast updates via WebSockets
       if (body.phase !== undefined) {
@@ -256,22 +331,27 @@ export class MaidCafeDO {
 
       this.broadcastToAdmins({
         type: "ROOM_UPDATED",
-        room: { id: roomId, name: newName, phase: newPhase, created_date: current.created_date }
+        room: updatedRoom
       });
 
-      return jsonResponse({
-        id: roomId,
-        name: newName,
-        phase: newPhase,
-        created_date: current.created_date,
-      });
+      return jsonResponse(updatedRoom);
     }
 
     // DELETE /api/rooms/:id
     if (roomDetailMatch && request.method === "DELETE") {
       const roomId = roomDetailMatch[1];
+
+      // SQLite Writes
       this.query("DELETE FROM guest_users WHERE room_id = ?", roomId);
       this.query("DELETE FROM rooms WHERE id = ?", roomId);
+
+      // Cache Writes
+      this.roomsCache.delete(roomId);
+      for (const [gid, g] of this.guestsCache.entries()) {
+        if (g.room_id === roomId) {
+          this.guestsCache.delete(gid);
+        }
+      }
 
       // Notify all active admin sockets about deleted room
       this.broadcastToAdmins({
@@ -287,16 +367,17 @@ export class MaidCafeDO {
       const sessionToken = url.searchParams.get("sessionToken");
       const roomId = url.searchParams.get("roomId");
 
-      let rows;
+      let filtered = Array.from(this.guestsCache.values());
+
       if (sessionToken) {
-        rows = this.query("SELECT * FROM guest_users WHERE session_token = ? ORDER BY created_date DESC", sessionToken);
+        filtered = filtered.filter(g => g.session_token === sessionToken);
       } else if (roomId) {
-        rows = this.query("SELECT * FROM guest_users WHERE room_id = ? ORDER BY created_date DESC", roomId);
-      } else {
-        rows = this.query("SELECT * FROM guest_users ORDER BY created_date DESC");
+        filtered = filtered.filter(g => g.room_id === roomId);
       }
 
-      const enriched = rows.map(row => {
+      filtered.sort((a, b) => b.created_date.localeCompare(a.created_date));
+
+      const enriched = filtered.map(row => {
         return {
           id: row.id,
           name: row.name,
@@ -328,8 +409,22 @@ export class MaidCafeDO {
       const activeVal = isActive !== false ? 1 : 0;
       const onlineVal = isOnline ? 1 : 0;
 
+      // SQLite Write
       this.query("INSERT INTO guest_users (id, name, room_id, session_token, is_active, is_online, created_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
         id, name, roomId, sessionToken, activeVal, onlineVal, createdDate);
+
+      // Cache Write
+      const guestRow = {
+        id,
+        name,
+        room_id: roomId,
+        session_token: sessionToken,
+        is_active: activeVal,
+        is_online: onlineVal,
+        last_seen: null,
+        created_date: createdDate
+      };
+      this.guestsCache.set(id, guestRow);
 
       const guestUrl = `${url.origin}/guest?token=${sessionToken}`;
 
@@ -359,7 +454,7 @@ export class MaidCafeDO {
     if (guestDetailMatch && request.method === "PATCH") {
       const guestId = guestDetailMatch[1];
       const body = await request.json();
-      const current = this.querySingle("SELECT * FROM guest_users WHERE id = ?", guestId);
+      const current = this.guestsCache.get(guestId);
       if (!current) return jsonResponse({ error: "Guest not found" }, 404);
 
       const newName = body.name !== undefined ? body.name : current.name;
@@ -369,8 +464,22 @@ export class MaidCafeDO {
       const newIsOnline = body.isOnline !== undefined ? (body.isOnline ? 1 : 0) : current.is_online;
       const newLastSeen = body.lastSeen !== undefined ? body.lastSeen : current.last_seen;
 
+      // SQLite Write
       this.query("UPDATE guest_users SET name = ?, room_id = ?, session_token = ?, is_active = ?, is_online = ?, last_seen = ? WHERE id = ?",
         newName, newRoomId, newSessionToken, newIsActive, newIsOnline, newLastSeen, guestId);
+
+      // Cache Write
+      const updatedGuestRow = {
+        id: guestId,
+        name: newName,
+        room_id: newRoomId,
+        session_token: newSessionToken,
+        is_active: newIsActive,
+        is_online: newIsOnline,
+        last_seen: newLastSeen,
+        created_date: current.created_date,
+      };
+      this.guestsCache.set(guestId, updatedGuestRow);
 
       const updatedGuest = {
         id: guestId,
@@ -398,7 +507,12 @@ export class MaidCafeDO {
     // DELETE /api/guests/:id
     if (guestDetailMatch && request.method === "DELETE") {
       const guestId = guestDetailMatch[1];
+
+      // SQLite Write
       this.query("DELETE FROM guest_users WHERE id = ?", guestId);
+
+      // Cache Write
+      this.guestsCache.delete(guestId);
 
       // Notify admins
       this.broadcastToAdmins({
@@ -412,8 +526,16 @@ export class MaidCafeDO {
     // GET /api/menu-items
     if (path === "/api/menu-items" && request.method === "GET") {
       const limit = Number(url.searchParams.get("limit")) || 100;
-      const rows = this.query("SELECT * FROM menu_items ORDER BY order_index ASC, created_date ASC LIMIT ?", limit);
-      const mapped = rows.map(row => ({
+      const sorted = Array.from(this.menuItemsCache.values())
+        .sort((a, b) => {
+          if (a.order_index !== b.order_index) {
+            return a.order_index - b.order_index;
+          }
+          return a.created_date.localeCompare(b.created_date);
+        })
+        .slice(0, limit);
+
+      const mapped = sorted.map(row => ({
         id: row.id,
         name: row.name,
         price: Number(row.price),
@@ -431,8 +553,24 @@ export class MaidCafeDO {
       const body = await request.json();
       const { id, name, price, category, description, imageUrl, order } = body;
       const createdDate = new Date().toISOString();
+
+      // SQLite Write
       this.query("INSERT INTO menu_items (id, name, price, category, description, image_url, order_index, created_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         id, name, price, category, description, imageUrl, order, createdDate);
+
+      // Cache Write
+      const menuItemObj = {
+        id,
+        name,
+        price,
+        category,
+        description,
+        image_url: imageUrl,
+        order_index: order,
+        created_date: createdDate
+      };
+      this.menuItemsCache.set(id, menuItemObj);
+
       return jsonResponse({ id, name, price, category, description, imageUrl, order, created_date: createdDate }, 201);
     }
 
@@ -441,7 +579,7 @@ export class MaidCafeDO {
     if (menuDetailMatch && request.method === "PATCH") {
       const itemId = menuDetailMatch[1];
       const body = await request.json();
-      const current = this.querySingle("SELECT * FROM menu_items WHERE id = ?", itemId);
+      const current = this.menuItemsCache.get(itemId);
       if (!current) return jsonResponse({ error: "Menu item not found" }, 404);
 
       const newName = body.name !== undefined ? body.name : current.name;
@@ -451,8 +589,22 @@ export class MaidCafeDO {
       const newImg = body.imageUrl !== undefined ? body.imageUrl : current.image_url;
       const newOrder = body.order !== undefined ? body.order : current.order_index;
 
+      // SQLite Write
       this.query("UPDATE menu_items SET name = ?, price = ?, category = ?, description = ?, image_url = ?, order_index = ? WHERE id = ?",
         newName, newPrice, newCategory, newDesc, newImg, newOrder, itemId);
+
+      // Cache Write
+      const updatedMenuItem = {
+        id: itemId,
+        name: newName,
+        price: newPrice,
+        category: newCategory,
+        description: newDesc,
+        image_url: newImg,
+        order_index: newOrder,
+        created_date: current.created_date
+      };
+      this.menuItemsCache.set(itemId, updatedMenuItem);
 
       return jsonResponse({
         id: itemId,
@@ -469,7 +621,13 @@ export class MaidCafeDO {
     // DELETE /api/menu-items/:id
     if (menuDetailMatch && request.method === "DELETE") {
       const itemId = menuDetailMatch[1];
+
+      // SQLite Write
       this.query("DELETE FROM menu_items WHERE id = ?", itemId);
+
+      // Cache Write
+      this.menuItemsCache.delete(itemId);
+
       return new Response(null, { status: 204 });
     }
 
@@ -478,6 +636,8 @@ export class MaidCafeDO {
 
   // Cloudflare WebSocket Hibernation API message receiver
   async webSocketMessage(ws, message) {
+    this.ensureCacheLoaded();
+
     const attachment = ws.deserializeAttachment();
     if (!attachment) return;
 
@@ -494,20 +654,25 @@ export class MaidCafeDO {
           return;
         }
 
-        const current = this.querySingle("SELECT * FROM rooms WHERE id = ?", roomId);
+        const current = this.roomsCache.get(roomId);
         if (!current) {
           ws.send(JSON.stringify({ type: "ERROR", message: "Room not found" }));
           return;
         }
 
+        // SQLite Write
         this.query("UPDATE rooms SET phase = ? WHERE id = ?", phase, roomId);
 
-        // Broadcast phase update via WebSocket to both general clients and admin dashboards
+        // Cache Write
+        current.phase = phase;
+        this.roomsCache.set(roomId, current);
+
+        // Broadcast phase update via WebSocket
         this.broadcastToRoom(roomId, { type: "PHASE_UPDATE", phase });
 
         this.broadcastToAdmins({
           type: "ROOM_UPDATED",
-          room: { id: roomId, name: current.name, phase, created_date: current.created_date }
+          room: current
         });
       }
 
@@ -523,9 +688,12 @@ export class MaidCafeDO {
 
           ws.send(JSON.stringify({ type: "AUTH_SUCCESS" }));
 
-          // Now safely send the initial administrative database state
-          const roomsList = this.query("SELECT * FROM rooms ORDER BY created_date DESC");
-          const guestsList = this.query("SELECT * FROM guest_users ORDER BY created_date DESC");
+          // Now safely send the initial administrative database state from CACHE (0% SQLite read overhead!)
+          const roomsList = Array.from(this.roomsCache.values())
+            .sort((a, b) => b.created_date.localeCompare(a.created_date));
+          const guestsList = Array.from(this.guestsCache.values())
+            .sort((a, b) => b.created_date.localeCompare(a.created_date));
+
           ws.send(JSON.stringify({
             type: "ADMIN_INIT",
             rooms: roomsList,
@@ -552,23 +720,49 @@ export class MaidCafeDO {
 
   // Cloudflare WebSocket Hibernation API connection close hook
   async webSocketClose(ws, code, reason, wasClean) {
+    this.ensureCacheLoaded();
+
     const attachment = ws.deserializeAttachment();
     if (attachment && attachment.guestId && attachment.role === "guest") {
-      this.query("UPDATE guest_users SET is_online = 0, last_seen = ? WHERE id = ?", new Date().toISOString(), attachment.guestId);
+      const timestamp = new Date().toISOString();
+      // SQLite Write
+      this.query("UPDATE guest_users SET is_online = 0, last_seen = ? WHERE id = ?", timestamp, attachment.guestId);
+
+      // Cache Write
+      const cachedGuest = this.guestsCache.get(attachment.guestId);
+      if (cachedGuest) {
+        cachedGuest.is_online = 0;
+        cachedGuest.last_seen = timestamp;
+        this.guestsCache.set(attachment.guestId, cachedGuest);
+      }
+
       this.broadcastToRoom(attachment.roomId, { type: "GUEST_UPDATE", guestId: attachment.guestId, isOnline: false });
     }
   }
 
   // Cloudflare WebSocket Hibernation API connection error hook
   async webSocketError(ws, error) {
+    this.ensureCacheLoaded();
+
     const attachment = ws.deserializeAttachment();
     if (attachment && attachment.guestId && attachment.role === "guest") {
-      this.query("UPDATE guest_users SET is_online = 0, last_seen = ? WHERE id = ?", new Date().toISOString(), attachment.guestId);
+      const timestamp = new Date().toISOString();
+      // SQLite Write
+      this.query("UPDATE guest_users SET is_online = 0, last_seen = ? WHERE id = ?", timestamp, attachment.guestId);
+
+      // Cache Write
+      const cachedGuest = this.guestsCache.get(attachment.guestId);
+      if (cachedGuest) {
+        cachedGuest.is_online = 0;
+        cachedGuest.last_seen = timestamp;
+        this.guestsCache.set(attachment.guestId, cachedGuest);
+      }
+
       this.broadcastToRoom(attachment.roomId, { type: "GUEST_UPDATE", guestId: attachment.guestId, isOnline: false });
     }
   }
 
-  // Broadcast to all sockets belonging to a specific roomId using Cloudflare's Hibernation getter
+  // Broadcast using Cloudflare's Hibernation getter
   broadcastToRoom(roomId, message) {
     const payload = JSON.stringify(message);
     const sockets = this.ctx.getWebSockets();
